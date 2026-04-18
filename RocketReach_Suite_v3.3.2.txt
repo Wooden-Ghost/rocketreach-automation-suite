@@ -1,0 +1,1551 @@
+(() => {
+  "use strict";
+
+  // =========================
+  // 0) 清理旧实例
+  // =========================
+  const OLD_KEYS = [
+    "__PX_RR_SUITE_V331__",
+    "__PX_CONTACT_SCRAPER_V23__",
+    "__LI_CAPTURE__",
+    "__PX_CONTACT_SCRAPER_V22__",
+    "__PX_CONTACT_SCRAPER_V21__",
+    "__PX_CONTACT_SCRAPER_V20__",
+    "__PX_CONTACT_SCRAPER_V14__",
+    "__PX_CONTACT_SCRAPER_V13__",
+    "__PX_CONTACT_SCRAPER_V12__",
+    "__PX_CONTACT_SCRAPER_V11__",
+    "__PX_CONTACT_SCRAPER_V1__",
+    "__PX_CONTACT_SCRAPER__",
+  ];
+  for (const k of OLD_KEYS) {
+    try { window[k]?.destroy?.(); } catch (e) {}
+    try { delete window[k]; } catch (e) {}
+  }
+  if (window.__PX_RR_SUITE_V332__) {
+    console.warn("已存在运行中的脚本：window.__PX_RR_SUITE_V332__。请先点面板【关闭】。");
+    return;
+  }
+
+  // =========================
+  // 1) 配置
+  // =========================
+  const CONFIG = {
+    version: "v3.3.2",
+
+    waitBeforeNextPage: [3500, 6000],
+    waitAfterNextPage: [9000, 12000],
+
+    restEveryN: 10,
+    restEveryNWait: [5000, 8000],
+
+    clickGapMs: [7000, 13000],
+
+    perRowScrollWait: [250, 550],
+    waitLookupTimeout: 45000,
+    waitExpandTimeout: 25000,
+    waitPageChangeTimeout: 35000,
+    liClickTimeout: 4500,
+
+    boxSampleRows: 4,
+    autoExportEvery: 0,
+
+    inMaxKeep: 5000,
+
+    // 全选批量等待时间（分钟）
+    bulkWaitMin: 2,
+    bulkWaitMax: 4,
+  };
+
+  // =========================
+  // 2) 工具函数
+  // =========================
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+  const rands = (pair) => rand(pair[0], pair[1]);
+  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+  function makePauseError(msg) {
+    const e = new Error(msg);
+    e.pauseOnly = true;
+    return e;
+  }
+
+  async function waitFor(predicate, timeoutMs, intervalMs = 250) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      try { 
+        const result = predicate();
+        if (result) return result; 
+      } catch (e) {}
+      await sleep(intervalMs);
+    }
+    return null;
+  }
+
+  function safeClick(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ behavior: "instant", block: "center" }); } catch (e) {}
+    try { el.click(); return true; } catch (e) { return false; }
+  }
+
+  function csvEscape(v) {
+    const s = v === null || v === undefined ? "" : String(v);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  // =========================
+  // 3) PageSize
+  // =========================
+  function getPageSize() {
+    const btn = document.getElementById("change-page-size-trigger");
+    const n = parseInt(btn?.querySelector("span")?.textContent || "", 10);
+    return Number.isFinite(n) && n > 0 ? n : 50;
+  }
+
+  // =========================
+  // 3.1) 完成后自动切换到 Companies tab
+  // =========================
+  function clickCompaniesTab() {
+    const el =
+      document.getElementById("headlessui-tabs-tab-2410") ||
+      [...document.querySelectorAll('button[role="tab"]')].find((b) => /companies/i.test(norm(b.innerText)));
+    if (el) {
+      try { el.click(); return true; } catch (e) {}
+    }
+    return false;
+  }
+
+  // =========================
+  // 4) “No results found” 识别
+  // =========================
+  function isNoResultsPage() {
+    const txt = document.body?.innerText || "";
+    if (/No results found\./i.test(txt)) return true;
+    if (/Results matching this query could not be displayed/i.test(txt)) return true;
+    const hasPid = !!document.querySelector('input[id^="profile-selection-"]');
+    return !hasPid && /No results/i.test(txt);
+  }
+
+  // =========================
+  // 5) DOM 定位函数（不变）
+  // =========================
+  function getAllProfileIdsInDOM() {
+    const inputs = [...document.querySelectorAll('input[id^="profile-selection-"]')];
+    const ids = [];
+    for (const i of inputs) {
+      const m = (i.id || "").match(/^profile-selection-(\d+)$/);
+      if (m) ids.push(m[1]);
+    }
+    return [...new Set(ids)];
+  }
+
+  function resolveRowByProfileId(pid) {
+    const expanded = document.querySelector(`[data-profile-card-id="${pid}"]`);
+    if (expanded) return expanded;
+
+    const cb = document.getElementById(`profile-selection-${pid}`);
+    if (!cb) return null;
+
+    let el = cb;
+    for (let k = 0; k < 20 && el && el !== document.body; k++) {
+      el = el.parentElement;
+      if (!el) break;
+      const hasName = !!el.querySelector("p#profile-name");
+      const hasMain = !!el.querySelector('[data-onboarding-id="main-contact-info-section"]');
+      if (hasName && hasMain) return el;
+    }
+    return cb.closest("div");
+  }
+
+  async function ensureRowInDOM(pid) {
+    let row = resolveRowByProfileId(pid);
+    if (row) return row;
+
+    const step = Math.max(300, Math.floor(window.innerHeight * 0.75));
+    const maxSteps = 30;
+    const startY = window.scrollY;
+
+    for (let i = 0; i < maxSteps; i++) {
+      window.scrollBy(0, step);
+      await sleep(180);
+      row = resolveRowByProfileId(pid);
+      if (row) return row;
+    }
+
+    window.scrollTo(0, startY);
+    await sleep(200);
+    return resolveRowByProfileId(pid);
+  }
+
+  function findMainSection(rowRoot) {
+    return rowRoot?.querySelector('[data-onboarding-id="main-contact-info-section"]') || null;
+  }
+  function findOtherSection(rowRoot) {
+    return rowRoot?.querySelector('[data-onboarding-id="other-contact-info-section"]') || null;
+  }
+
+  function findGetContactBtn(rowRoot) {
+    if (!rowRoot) return null;
+    let btn = rowRoot.querySelector('button[data-px-single-lookup="true"]');
+    if (btn && /get contact info/i.test(btn.innerText)) return btn;
+
+    const bs = [...rowRoot.querySelectorAll("button")];
+    btn = bs.find((b) => /get contact info/i.test(norm(b.innerText)));
+    return btn || null;
+  }
+
+  function isDisabledGetContact(btn) {
+    if (!btn) return false;
+    const cls = btn.className || "";
+    return !!(
+      btn.disabled ||
+      btn.hasAttribute("disabled") ||
+      cls.includes("cursor-not-allowed") ||
+      cls.includes("bg-rr-grey-200")
+    );
+  }
+
+  function findViewMoreBtn(rowRoot) {
+    if (!rowRoot) return null;
+    const bs = [...rowRoot.querySelectorAll("button")];
+    return bs.find((b) => /^view more$/i.test(norm(b.innerText))) || null;
+  }
+  function findViewLessBtn(rowRoot) {
+    if (!rowRoot) return null;
+    const bs = [...rowRoot.querySelectorAll("button")];
+    return bs.find((b) => /^view less$/i.test(norm(b.innerText))) || null;
+  }
+
+  function isExpandedRow(rowRoot) {
+    if (!rowRoot) return false;
+    if (findOtherSection(rowRoot)) return true;
+    if (findViewLessBtn(rowRoot)) return true;
+    return false;
+  }
+
+  function hrefToEmail(href) {
+    if (!href) return "";
+    if (href.startsWith("mailto:")) return norm(href.replace(/^mailto:/i, "").split("?")[0]);
+    return "";
+  }
+
+  function collectContactsByItems(sectionRoot) {
+    if (!sectionRoot) return { emails: [], phones: [] };
+
+    const items = [...sectionRoot.querySelectorAll('div[class*="@container"]')];
+
+    const emails = [];
+    const phones = [];
+    const seenE = new Set();
+    const seenP = new Set();
+
+    for (const item of items) {
+      const a =
+        item.querySelector('a[data-testid="email-phone-text-desktop"][href^="mailto:"],a[data-testid="email-phone-text-desktop"][href^="tel:"]') ||
+        item.querySelector('a[data-testid="email-phone-text-mobile"][href^="mailto:"],a[data-testid="email-phone-text-mobile"][href^="tel:"]') ||
+        item.querySelector('a[href^="mailto:"],a[href^="tel:"]');
+
+      if (!a) continue;
+
+      const href = a.getAttribute("href") || "";
+      const textValue = norm(a.textContent);
+      const grade = norm(item.querySelector('span[data-testid="contact-grade-text"]')?.textContent);
+
+      if (href.startsWith("mailto:")) {
+        const email = hrefToEmail(href) || textValue;
+        if (!email || seenE.has(email)) continue;
+        seenE.add(email);
+        emails.push({ grade, email });
+      } else if (href.startsWith("tel:")) {
+        const phone = textValue;
+        if (!phone || seenP.has(phone)) continue;
+        seenP.add(phone);
+        phones.push({ phone });
+      }
+    }
+    return { emails, phones };
+  }
+
+  function extractLinkedInFromRow(rowRoot) {
+    if (!rowRoot) return "";
+    const as = [...rowRoot.querySelectorAll("a[href]")];
+
+    let bestUrl = "";
+    let bestScore = 0;
+
+    for (const a of as) {
+      const href = a.getAttribute("href") || "";
+      if (!href) continue;
+
+      let abs = href;
+      try { abs = new URL(href, location.href).toString(); } catch (e) {}
+
+      const clean =
+        normalizeLinkedIn(abs) ||
+        normalizeLinkedIn(tryDecode(abs)) ||
+        normalizeLinkedIn(href) ||
+        normalizeLinkedIn(tryDecode(href));
+
+      if (!clean) continue;
+
+      const score =
+        /linkedin\.com\/in\//i.test(clean) ? 30 :
+        /linkedin\.com\/pub\//i.test(clean) ? 25 :
+        /linkedin\.com\/company\//i.test(clean) ? 10 :
+        5;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = clean;
+      }
+    }
+    if (!bestUrl) {
+      const html = rowRoot.innerHTML || "";
+      const mm = html.match(/https?:\/\/[^\s"'<>]*linkedin\.com\/[^\s"'<>]*/i);
+      if (mm) {
+        const clean = normalizeLinkedIn(mm[0]) || normalizeLinkedIn(tryDecode(mm[0]));
+        if (clean) bestUrl = clean;
+      }
+    }
+    return bestUrl || "";
+  }
+
+  function findLinkedInButton(rowRoot) {
+    if (!rowRoot) return null;
+    return (
+      rowRoot.querySelector('button[data-testid="social-button"][title="LinkedIn"]') ||
+      rowRoot.querySelector('button[title="LinkedIn"]') ||
+      rowRoot.querySelector('button[data-testid="social-button"] i.fa-linkedin-in')?.closest("button") ||
+      null
+    );
+  }
+
+  async function ensureLinkedInForRow(rowRoot, pid, name) {
+    const key = String(pid);
+    const cached = IN.pidMap.get(key);
+    if (cached) return cached;
+
+    let url = extractLinkedInFromRow(rowRoot);
+    if (url) {
+      addINItem(url, name, pid);
+      return IN.pidMap.get(key) || url || "";
+    }
+
+    const btn = findLinkedInButton(rowRoot);
+    if (!btn) return "";
+
+    const prevAllow = IN.allowOpen;
+    IN.allowOpen = false;
+    IN.pendingPid = key;
+    IN.pendingName = name || "";
+
+    safeClick(btn);
+
+    const ok = await waitFor(() => !!IN.pidMap.get(key), CONFIG.liClickTimeout, 120);
+    IN.pendingPid = null;
+    IN.pendingName = "";
+    IN.allowOpen = prevAllow;
+
+    if (ok) return IN.pidMap.get(key) || "";
+
+    await sleep(200);
+    url = extractLinkedInFromRow(rowRoot);
+    if (url) {
+      addINItem(url, name, pid);
+      return IN.pidMap.get(key) || url || "";
+    }
+    return IN.pidMap.get(key) || "";
+  }
+
+  async function extractRowByProfileId(pid) {
+    const row = resolveRowByProfileId(pid);
+    if (!row) throw new Error(`无法定位 profileId=${pid} 的行容器`);
+
+    const name = norm(row.querySelector("p#profile-name")?.textContent);
+
+    let title = "";
+    const nameBlock = row.querySelector("p#profile-name")?.closest("div");
+    if (nameBlock) {
+      const col = nameBlock.closest("div")?.parentElement;
+      title = norm(col?.querySelector('p.text-sm.font-medium-420')?.textContent);
+    }
+    if (!title) title = norm(row.querySelector('p.text-sm.font-medium-420')?.textContent);
+
+    const linkedin = await ensureLinkedInForRow(row, pid, name);
+    const company =
+      norm(row.querySelector('a[target="_blank"][href^="/"] span.text-base.font-heavy-552')?.textContent) ||
+      norm(row.querySelector("span.text-base.font-heavy-552")?.textContent);
+
+    const address =
+      norm(row.querySelector('div.mx-0.my-auto.hidden.lg\\:block div.medium-420.text-sm.text-rr-basic-black span')?.textContent) ||
+      norm(row.querySelector("div.medium-420.text-sm.text-rr-basic-black span")?.textContent);
+
+    const main = findMainSection(row);
+    const other = findOtherSection(row);
+
+    const mainC = collectContactsByItems(main);
+    const otherC = collectContactsByItems(other);
+
+    const mergedEmails = [...mainC.emails, ...otherC.emails];
+    const mergedPhones = [...mainC.phones, ...otherC.phones];
+
+    const emails = [];
+    const eSeen = new Set();
+    for (const e of mergedEmails) {
+      if (eSeen.has(e.email)) continue;
+      eSeen.add(e.email);
+      emails.push(e);
+    }
+
+    const phones = [];
+    const pSeen = new Set();
+    for (const p of mergedPhones) {
+      if (pSeen.has(p.phone)) continue;
+      pSeen.add(p.phone);
+      phones.push(p);
+    }
+
+    return { pid, name, title, linkedin, company, address, emails, phones };
+  }
+
+  // =========================
+  // 6) 框选自检（不变）
+  // =========================
+  function clearHighlights() {
+    document.getElementById("pxcs-box-layer")?.remove();
+  }
+  function ensureBoxLayer() {
+    let layer = document.getElementById("pxcs-box-layer");
+    if (!layer) {
+      layer = document.createElement("div");
+      layer.id = "pxcs-box-layer";
+      layer.style.cssText = `position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:2147483646;`;
+      document.body.appendChild(layer);
+    }
+    return layer;
+  }
+  function drawBox(el, color, label) {
+    if (!el?.getBoundingClientRect) return;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2) return;
+    const layer = ensureBoxLayer();
+    const d = document.createElement("div");
+    d.style.cssText = `position:fixed;left:${Math.max(0, r.left)}px;top:${Math.max(0, r.top)}px;width:${Math.max(0, r.width)}px;height:${Math.max(0, r.height)}px;border:2px solid ${color};box-sizing:border-box;border-radius:4px;background:rgba(0,0,0,0.02);`;
+    if (label) {
+      const tag = document.createElement("div");
+      tag.textContent = label;
+      tag.style.cssText = `position:absolute;left:0;top:-18px;font:12px/1.2 sans-serif;color:${color};background:rgba(255,255,255,0.92);padding:1px 4px;border-radius:4px;border:1px solid ${color};`;
+      d.appendChild(tag);
+    }
+    layer.appendChild(d);
+  }
+
+  async function preflightBox() {
+    clearHighlights();
+    const pids = getAllProfileIdsInDOM();
+    if (!pids.length) throw new Error("本页未找到任何 profile-selection-xxxx（列表未加载/DOM变化）。");
+
+    const nextBtn = document.querySelector('button[aria-label="Next page"]');
+    if (nextBtn) drawBox(nextBtn, "#b000ff", "Next Page");
+
+    const sample = pids.slice(0, CONFIG.boxSampleRows);
+    for (let i = 0; i < sample.length; i++) {
+      const pid = sample[i];
+      const row = await ensureRowInDOM(pid);
+      if (!row) continue;
+
+      const name = row.querySelector("p#profile-name");
+      const title = (name?.closest("div")?.parentElement?.querySelector('p.text-sm.font-medium-420')) || row.querySelector('p.text-sm.font-medium-420');
+      const company = row.querySelector('a[target="_blank"][href^="/"] span.text-base.font-heavy-552') || row.querySelector("span.text-base.font-heavy-552");
+      const addr = row.querySelector("div.medium-420.text-sm.text-rr-basic-black span");
+
+      if (name) drawBox(name, "#ff0033", `姓名#${i + 1}`);
+      if (title) drawBox(title, "#aa5500", `职位#${i + 1}`);
+      if (company) drawBox(company, "#0033aa", `公司#${i + 1}`);
+      if (addr) drawBox(addr, "#008080", `地址#${i + 1}`);
+
+      const main = findMainSection(row);
+      const other = findOtherSection(row);
+      const getBtn = findGetContactBtn(row);
+      const moreBtn = findViewMoreBtn(row);
+      const lessBtn = findViewLessBtn(row);
+
+      if (getBtn) {
+        drawBox(getBtn, isDisabledGetContact(getBtn) ? "#ff4d4f" : "#ffd666", isDisabledGetContact(getBtn) ? "Get Contact(disabled)" : "Get Contact Info");
+      }
+      if (moreBtn) drawBox(moreBtn, "#0077ff", "View More");
+      if (lessBtn) drawBox(lessBtn, "#00a35a", "View Less");
+      if (main) drawBox(main, "#b000ff", "Main区域");
+      if (other) drawBox(other, "#00e5ff", "Other区域");
+    }
+  }
+
+  // =========================
+  // 7) IN 捕获模块（不变）
+  // =========================
+  const IN = {
+    enabled: true,
+    allowOpen: true,
+    items: [],
+    maxKeep: CONFIG.inMaxKeep,
+    pidMap: new Map(),
+    pendingPid: null,
+    pendingName: "",
+  };
+
+  function tryDecode(str) {
+    try { return decodeURIComponent(str); } catch { return str; }
+  }
+  function normalizeLinkedIn(raw) {
+    if (!raw || typeof raw !== "string") return null;
+
+    const pickFromParams = (u) => {
+      const keys = ["sessionRedirect", "url", "target", "redirect", "redir", "r"];
+      for (const k of keys) {
+        const v = u.searchParams.get(k);
+        if (v && v.includes("linkedin.com/")) return tryDecode(v);
+      }
+      return null;
+    };
+
+    const decoded = tryDecode(raw);
+    const m = decoded.match(/https?:\/\/[^\s"'<>]*linkedin\.com\/[^\s"'<>]*/i);
+    if (m) raw = m[0];
+
+    try {
+      const u = new URL(raw, location.href);
+      const maybe = pickFromParams(u);
+      if (maybe && maybe.includes("linkedin.com/")) {
+        if (maybe === raw) return null;
+        return normalizeLinkedIn(maybe);
+      }
+      if (!u.hostname.includes("linkedin.com")) return null;
+      u.search = "";
+      u.hash = "";
+      return u.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function guessNameFromEl(el) {
+    if (!el) return "";
+    const root = el.closest('tr, [role="row"], [data-testid], li, article, section, div') || document.body;
+    const cand = root.querySelector("h3, strong, [data-testid*='name'], a[href*='/app/'], a[href*='/people/']");
+    const t = (cand?.textContent || "").trim().replace(/\s+/g, " ");
+    return t.slice(0, 80);
+  }
+
+  function addINItem(url, name, pid) {
+    const clean = normalizeLinkedIn(url);
+    if (!clean) return false;
+    if (pid) IN.pidMap.set(String(pid), clean);
+    if (IN.items.some(x => x.url === clean)) return true;
+
+    IN.items.unshift({
+      name: (name || "").trim(),
+      url: clean,
+      time: new Date().toLocaleString()
+    });
+    if (IN.items.length > IN.maxKeep) IN.items.length = IN.maxKeep;
+    renderINList();
+    return true;
+  }
+
+  function onDocClickCapture(e) {
+    if (!IN.enabled) return;
+
+    const el = e.target;
+    const a = el?.closest?.("a[href]") || null;
+    const href = a?.getAttribute?.("href") || "";
+    const abs = href ? (() => {
+      try { return new URL(href, location.href).toString(); } catch { return href; }
+    })() : "";
+
+    const isLI = abs && /linkedin\.com\//i.test(abs);
+    if (!isLI) return;
+
+    const name = guessNameFromEl(el);
+    addINItem(abs, name);
+
+    if (!IN.allowOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      try { e.stopImmediatePropagation(); } catch (_) {}
+    }
+  }
+
+  const OpenHook = {
+    installed: false,
+    origOpen: null,
+  };
+  function installOpenHook() {
+    if (OpenHook.installed) return;
+    OpenHook.installed = true;
+    OpenHook.origOpen = window.open;
+
+    window.open = function (url, ...rest) {
+      try {
+        if (IN.enabled && typeof url === "string" && /linkedin\.com\//i.test(url)) {
+          const metaName = guessNameFromEl(document.activeElement) || "";
+          const pid = IN.pendingPid || "";
+          const nm = IN.pendingName || metaName || "";
+          addINItem(url, nm, pid);
+          if (pid) { IN.pendingPid = null; IN.pendingName = ""; }
+          if (!IN.allowOpen) return null;
+        }
+      } catch (e) {}
+      return OpenHook.origOpen.call(this, url, ...rest);
+    };
+  }
+
+  function uninstallOpenHook() {
+    if (!OpenHook.installed) return;
+    try { window.open = OpenHook.origOpen; } catch (e) {}
+    OpenHook.installed = false;
+  }
+
+  // =========================
+  // 8) 插入筛选关键词（直接塞字符串；以 - 开头表示剔除词）
+  // =========================
+  function getJobTitleFilterInput() {
+    return (
+      document.querySelector('input[list="053bbacd-ac23-44b8-9072-20ee099c3c9b"][placeholder="Enter Job Title..."]') ||
+      document.querySelector('input[placeholder="Enter Job Title..."]') ||
+      null
+    );
+  }
+
+  function setNativeInputValue(el, value) {
+    if (!el) return;
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (desc && typeof desc.set === 'function') {
+      desc.set.call(el, value);
+    } else {
+      el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function insertRocketReachFilters() {
+    const keywords = [
+      'packaging','package',
+      'procurement','purchasing','buyer','sourcing','category','vendor',
+      'supply','meterial','material','materials','demand','inventory','mrp','planning',
+      'CEO','President','Chief','Director','VP','partner','founder','manager','managing','supplier','executive',
+      '- HR',
+      '- Human Resources',
+      '- Talent Acquisition',
+      '- Recruiter',
+      '- Recruitment',
+      '- People Operations',
+      '- Compensation and Benefits',
+      '- Payroll',
+      '- Learning and Development',
+      '- IT',
+      '- IT Support',
+      '- Technical Support',
+      '- Helpdesk',
+      '- Service Desk',
+      '- Desktop Support',
+      '- System Administrator',
+      '- Network Administrator',
+      '- Infrastructure Engineer',
+      '- Cybersecurity',
+      '- Database Administrator',
+      '- ERP Administrator',
+      '- SAP Administrator',
+      '- CRM Administrator',
+      '- Accountant',
+      '- Accounting',
+      '- Accounts Payable',
+      '- Accounts Receivable',
+      '- Payroll Specialist',
+      '- Tax Manager',
+      '- Treasury',
+      '- Internal Auditor',
+      '- Financial Controller',
+      '- FP&A',
+      '- Legal Counsel',
+      '- Attorney',
+      '- Paralegal',
+      '- General Counsel',
+      '- Personal Assistant',
+      '- Receptionist',
+      '- Front Desk',
+      '- Office Administrator',
+      '- Secretary',
+      '- Store Manager',
+      '- Retail Associate',
+      '- Cashier',
+      '- Sales',
+      '- Sales Associate',
+      '- Maintenance',
+      '- Facilities Manager',
+      '- Facility Technician',
+      '- Mechanic',
+      '- Electrician'
+    ];
+
+    const input = getJobTitleFilterInput();
+    if (!input) {
+      addLog('未找到筛选输入框：Enter Job Title...（确认已打开筛选面板）', 'error');
+      state.errors++;
+      setStatus();
+      return;
+    }
+
+    const isFirstRun = state.filterInsertRuns === 0;
+    const gapMs = isFirstRun ? 220 : 0;
+
+    const pressEnter = (el) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+
+    const pushKeyword = (keyword) => {
+      input.focus();
+      setNativeInputValue(input, keyword);
+      pressEnter(input);
+    };
+
+    addLog(
+      `开始插入筛选关键词（共 ${keywords.length} 个；${isFirstRun ? '首次运行按原速度执行' : '本次按极速瞬间连续插入'}；以 - 开头的词交给 RocketReach 自行识别为剔除词）...`,
+      'info'
+    );
+
+    state.filterInsertRuns += 1;
+
+    if (gapMs > 0) {
+      let i = 0;
+      const timer = setInterval(() => {
+        if (i >= keywords.length) {
+          clearInterval(timer);
+          addLog('筛选关键词插入完成。', 'success');
+          return;
+        }
+
+        pushKeyword(keywords[i++]);
+      }, gapMs);
+      return;
+    }
+
+    (async () => {
+      for (let i = 0; i < keywords.length; i++) {
+        pushKeyword(keywords[i]);
+        if (i % 8 === 7) await sleep(0);
+      }
+      addLog('筛选关键词插入完成。', 'success');
+    })();
+  }
+
+  // =========================
+  // 9) 运行状态（新增 mode 字段）
+  // =========================
+  const state = {
+    isRunning: false,
+    isPaused: false,
+    pageIndex: 0,
+    processedCount: 0,
+    errors: 0,
+    collectedData: [],
+    processedPids: new Set(),
+    clickedGetContact: new Set(),
+    startedAt: null,
+    mode: 'normal', // 'normal' 或 'bulk'
+    filterInsertRuns: 0,
+  };
+
+  // =========================
+  // 10) UI（面板修改：移除预览抽取，添加全选爬取按钮）
+  // =========================
+  let panel, logBox, statusLine, bodyWrap, inCountEl, inListEl;
+
+  function addLog(msg, level = "info") {
+    const time = new Date().toLocaleTimeString();
+    const line = document.createElement("div");
+    const color =
+      level === "error" ? "#ff4d4f" :
+      level === "warn" ? "#faad14" :
+      level === "success" ? "#52c41a" :
+      "#d9d9d9";
+    line.style.cssText = `font:12px/1.4 ui-monospace;color:${color};margin:2px 0;white-space:pre-wrap;word-break:break-word;`;
+    line.textContent = `[${time}] ${msg}`;
+    logBox.appendChild(line);
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function setStatus() {
+    const run = state.isRunning ? (state.isPaused ? "暂停中" : `运行中(${state.mode})`) : "未运行";
+    statusLine.textContent =
+      `状态: ${run} | 页: ${state.pageIndex} | 已处理: ${state.processedCount} | 记录: ${state.collectedData.length} | 错误: ${state.errors} | 每页: ${getPageSize()}`;
+  }
+
+  function createButton(text, onClick, style = "") {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.style.cssText =
+      `cursor:pointer;user-select:none;border:1px solid rgba(255,255,255,0.18);background:rgba(255,255,255,0.08);color:#fff;padding:8px 10px;border-radius:8px;font:12px/1.2 system-ui;width:100%;min-height:36px;display:flex;align-items:center;justify-content:center;text-align:center;white-space:nowrap;box-sizing:border-box;` +
+      style;
+    b.onclick = onClick;
+    return b;
+  }
+
+  function flash(msg) {
+    const tip = document.createElement("div");
+    tip.textContent = msg;
+    tip.style.cssText = `
+      position: fixed; left: 14px; bottom: 14px; z-index: 2147483647;
+      background: rgba(0,0,0,.85); color:#fff; padding:8px 10px;
+      border-radius: 8px; font-size: 12px; border:1px solid rgba(255,255,255,.12);
+    `;
+    document.body.appendChild(tip);
+    setTimeout(() => tip.remove(), 1100);
+  }
+
+  function renderINList() {
+    if (!inCountEl || !inListEl) return;
+    inCountEl.textContent = String(IN.items.length);
+    const html = IN.items.slice(0, 40).map((x, idx) => {
+      const name = (x.name || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const url = (x.url || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return `
+        <div style="padding:6px 0; border-bottom:1px dashed rgba(255,255,255,.15);">
+          <div style="opacity:.9; margin-bottom:2px;">${idx + 1}. ${name || "(未识别姓名)"}</div>
+          <div style="word-break:break-all; color:#9ad;">${url}</div>
+        </div>
+      `;
+    }).join("");
+    inListEl.innerHTML = html || `<div style="opacity:.75;">暂无 IN 数据（启用开关后，手动点击 LinkedIn 图标/链接即可捕获）</div>`;
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      flash("已复制到剪贴板");
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      flash("已复制到剪贴板");
+    }
+  }
+
+  function exportINCSV() {
+    const header = ["name", "linkedin_url", "time"];
+    const rows = IN.items.map(x => [
+      (x.name || "").replaceAll('"', '""'),
+      (x.url || "").replaceAll('"', '""'),
+      (x.time || "").replaceAll('"', '""')
+    ]);
+    const csv = [header, ...rows].map(r => `"${r[0]}","${r[1]}","${r[2]}"`).join("\n");
+    downloadText(`linkedin_links_${Date.now()}.csv`, csv);
+  }
+
+  function createPanel() {
+    panel = document.createElement("div");
+    panel.id = "pxrr-suite-panel";
+    panel.style.cssText =
+      `position:fixed;left:14px;top:14px;z-index:2147483647;width:640px;background:rgba(20,20,24,0.92);border:1px solid rgba(255,255,255,0.15);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,0.35);color:#fff;overflow:hidden;`;
+
+    const header = document.createElement("div");
+    header.style.cssText =
+      `padding:10px 12px;cursor:move;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.06);border-bottom:1px solid rgba(255,255,255,0.12);`;
+
+    const title = document.createElement("div");
+    title.textContent = `RocketReach Suite ${CONFIG.version}`;
+    title.style.cssText = `font:13px/1.2 system-ui;font-weight:700;`;
+
+    const headerBtns = document.createElement("div");
+    headerBtns.style.cssText = `display:flex;gap:8px;`;
+
+    const btnMin = createButton("最小化", () => {
+      const show = bodyWrap.style.display !== "none";
+      bodyWrap.style.display = show ? "none" : "block";
+      btnMin.textContent = show ? "展开" : "最小化";
+    }, `background:rgba(255,255,255,0.10);`);
+
+    const btnClose = createButton("关闭", () => destroy(), `background:rgba(255,77,79,0.22);border-color:rgba(255,77,79,0.35);`);
+
+    headerBtns.appendChild(btnMin);
+    headerBtns.appendChild(btnClose);
+    header.appendChild(title);
+    header.appendChild(headerBtns);
+
+    let dragging = false, ox = 0, oy = 0;
+    header.addEventListener("mousedown", (e) => {
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      panel.style.left = `${Math.max(6, e.clientX - ox)}px`;
+      panel.style.top = `${Math.max(6, e.clientY - oy)}px`;
+    });
+    window.addEventListener("mouseup", () => dragging = false);
+
+    bodyWrap = document.createElement("div");
+    bodyWrap.style.cssText = `padding:10px 12px;`;
+
+    statusLine = document.createElement("div");
+    statusLine.style.cssText = `font:12px/1.2 system-ui;color:#d9d9d9;margin-bottom:8px;`;
+    bodyWrap.appendChild(statusLine);
+
+    // ===== RR 按钮区 =====
+    const actionGrid = document.createElement("div");
+    actionGrid.style.cssText = `display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px;align-items:stretch;`;
+
+    const btnStart = createButton("开始爬取", () => startNormal(), `background:rgba(82,196,26,0.18);border-color:rgba(82,196,26,0.35);`);
+    const btnBulk = createButton("全选爬取", () => startBulk(), `background:rgba(0,170,255,0.18);border-color:rgba(0,170,255,0.35);`);
+    const btnPause = createButton("暂停/继续", () => togglePause(), `background:rgba(250,173,20,0.18);border-color:rgba(250,173,20,0.35);`);
+    const btnStop = createButton("停止", () => stop(), `background:rgba(255,77,79,0.22);border-color:rgba(255,77,79,0.35);`);
+    const btnClear = createButton("清除缓存", () => clearCache(), `background:rgba(24,144,255,0.18);border-color:rgba(24,144,255,0.35);`);
+    const btnExport = createButton("导出RR CSV", () => exportRRCSV(), `background:rgba(176,0,255,0.18);border-color:rgba(176,0,255,0.35);`);
+    const btnInsertFilters = createButton("插入筛选关键词", () => insertRocketReachFilters(),
+      `background:rgba(0,170,255,0.18);border-color:rgba(0,170,255,0.35);`
+    );
+
+    actionGrid.appendChild(btnStart);
+    actionGrid.appendChild(btnPause);
+    actionGrid.appendChild(btnClear);
+    actionGrid.appendChild(btnExport);
+    actionGrid.appendChild(btnBulk);
+    actionGrid.appendChild(btnStop);
+    actionGrid.appendChild(btnInsertFilters);
+    bodyWrap.appendChild(actionGrid);
+
+    // ===== Log 区 =====
+    logBox = document.createElement("div");
+    logBox.style.cssText = `height:240px;overflow:auto;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:8px;background:rgba(0,0,0,0.20);`;
+    bodyWrap.appendChild(logBox);
+
+    panel.appendChild(header);
+    panel.appendChild(bodyWrap);
+    document.body.appendChild(panel);
+
+    setStatus();
+    renderINList();
+
+    addLog("已就绪：全选爬取模式将先检测单条 Get Contact 按钮，存在则执行批量操作，否则直接抽取。", "info");
+    addLog(`点击节奏：每次点击后随机等待 7–13s。`, "success");
+    addLog(`休息规则：每 10 条随机休息 5–8s。`, "success");
+    addLog("最后一页再点 Next 若出现 No results found：会自动停止，并尽量回到上一页后结束。", "warn");
+  }
+
+  // =========================
+  // 11) 导出 RR CSV（不变）
+  // =========================
+  function exportRRCSV() {
+    const rows = state.collectedData;
+    if (!rows.length) {
+      addLog("暂无数据可导出。", "warn");
+      return;
+    }
+    let maxE = 0, maxP = 0;
+    for (const r of rows) {
+      maxE = Math.max(maxE, r.emails?.length || 0);
+      maxP = Math.max(maxP, r.phones?.length || 0);
+    }
+
+    const header = ["姓名", "职位", "LinkedIn", "公司", "地址"];
+    for (let i = 1; i <= maxE; i++) header.push(`邮箱标识${i}`, `邮箱${i}`);
+    for (let i = 1; i <= maxP; i++) header.push(`电话${i}`);
+
+    const lines = [];
+    lines.push(header.map(csvEscape).join(","));
+
+    for (const r of rows) {
+      const line = [r.name || "", r.title || "", (r.linkedin || ""), r.company || "", r.address || ""];
+      for (let i = 0; i < maxE; i++) {
+        const e = r.emails?.[i];
+        line.push(e?.grade || "", e?.email || "");
+      }
+      for (let i = 0; i < maxP; i++) {
+        const p = r.phones?.[i];
+        line.push(p?.phone || "");
+      }
+      lines.push(line.map(csvEscape).join(","));
+    }
+
+    const fn = `contacts_${new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")}.csv`;
+    downloadText(fn, lines.join("\n"));
+    addLog(`已导出：${fn}（rows=${rows.length}）`, "success");
+  }
+
+  // =========================
+  // 12) 清缓存 / 暂停 / 停止（不变）
+  // =========================
+  function clearCache() {
+    state.processedPids.clear();
+    state.clickedGetContact.clear();
+    state.collectedData = [];
+    state.processedCount = 0;
+    state.errors = 0;
+    state.pageIndex = 0;
+    addLog("已清除缓存：已处理/已点击/GetContact 记录 & 已采集数据清空。", "success");
+    setStatus();
+  }
+
+  function togglePause() {
+    if (!state.isRunning) {
+      addLog("当前未运行，先点【开始爬取】或【全选爬取】。", "warn");
+      return;
+    }
+    state.isPaused = !state.isPaused;
+    addLog(state.isPaused ? "已暂停。" : "已继续运行。", "success");
+    setStatus();
+  }
+
+  function stop() {
+    if (!state.isRunning) {
+      addLog("当前未运行。", "warn");
+      return;
+    }
+    state.isRunning = false;
+    state.isPaused = false;
+    addLog("已停止运行。", "warn");
+    setStatus();
+  }
+
+  async function waitIfPaused() {
+    while (state.isRunning && state.isPaused) await sleep(300);
+  }
+
+  // 带暂停检查的等待
+  async function sleepWithPause(ms) {
+    const step = 1000;
+    const start = Date.now();
+    while (Date.now() - start < ms && state.isRunning) {
+      await waitIfPaused();
+      if (!state.isRunning) break;
+      const elapsed = Date.now() - start;
+      const remaining = ms - elapsed;
+      if (remaining <= 0) break;
+      await sleep(Math.min(step, remaining));
+    }
+  }
+
+  // =========================
+  // 13) 核心动作：确保已 lookup + 已展开（不变）
+  // =========================
+  async function ensureLookupAndExpanded(pid) {
+    let row = await ensureRowInDOM(pid);
+    if (!row) throw new Error(`找不到该条目 DOM（pid=${pid}）`);
+
+    try {
+      row.scrollIntoView({ behavior: "instant", block: "center" });
+      await sleep(rands(CONFIG.perRowScrollWait));
+    } catch (e) {}
+
+    if (!state.clickedGetContact.has(pid)) {
+      let getBtn = findGetContactBtn(row);
+      if (getBtn) {
+        if (isDisabledGetContact(getBtn)) {
+          throw makePauseError(`Get Contact Info 为灰色不可点击（disabled）。请手动处理后点【暂停/继续】继续。（pid=${pid}）`);
+        }
+
+        addLog(`pid=${pid} 点击 Get Contact Info...`, "info");
+        if (!safeClick(getBtn)) throw makePauseError(`Get Contact Info 点击失败（可能被风控/变灰）。已自动暂停。（pid=${pid}）`);
+        state.clickedGetContact.add(pid);
+
+        await sleep(rands(CONFIG.clickGapMs));
+
+        const ok = await waitFor(() => !!resolveRowByProfileId(pid), CONFIG.waitLookupTimeout);
+        if (!ok) throw new Error(`等待 Get Contact Info 加载超时（pid=${pid}）`);
+        addLog(`pid=${pid} Get Contact Info 加载完成。`, "success");
+      }
+    }
+
+    await waitIfPaused();
+
+    row = await ensureRowInDOM(pid);
+    if (!row) throw new Error(`展开前再次定位失败（pid=${pid}）`);
+
+    if (!isExpandedRow(row)) {
+      const moreBtn = findViewMoreBtn(row);
+      if (moreBtn) {
+        addLog(`pid=${pid} 点击 View More...`, "info");
+        if (!safeClick(moreBtn)) throw new Error(`View More 点击失败（pid=${pid}）`);
+
+        await sleep(rands(CONFIG.clickGapMs));
+
+        const ok = await waitFor(() => {
+          const r2 = resolveRowByProfileId(pid);
+          return r2 && isExpandedRow(r2);
+        }, CONFIG.waitExpandTimeout);
+
+        if (!ok) throw new Error(`等待 View More 展开超时（pid=${pid}）`);
+        addLog(`pid=${pid} 展开完成（View Less）。`, "success");
+      } else {
+        addLog(`pid=${pid} 未找到 View More（可能已展开/或布局变化）。`, "warn");
+      }
+    }
+  }
+
+  // =========================
+  // 14) 处理单条（不变）
+  // =========================
+  async function processOne(pid) {
+    await waitIfPaused();
+    if (!state.isRunning) return false;
+    if (state.processedPids.has(pid)) return true;
+
+    await ensureLookupAndExpanded(pid);
+    await waitIfPaused();
+    if (!state.isRunning) return false;
+
+    const data = await extractRowByProfileId(pid);
+
+    state.collectedData.push(data);
+    state.processedPids.add(pid);
+    state.processedCount++;
+
+    addLog(`OK pid=${pid} | ${data.name} | Emails=${data.emails.length} | Phones=${data.phones.length}`, "success");
+
+    if (state.processedCount % CONFIG.restEveryN === 0) {
+      const ms = rands(CONFIG.restEveryNWait);
+      addLog(`已处理 ${state.processedCount} 个，随机休息 ${Math.round(ms/1000)}s...`, "warn");
+      await sleep(ms);
+    }
+
+    if (CONFIG.autoExportEvery > 0 && state.collectedData.length % CONFIG.autoExportEvery === 0) {
+      addLog(`触发自动导出（每 ${CONFIG.autoExportEvery} 条）...`, "info");
+      exportRRCSV();
+    }
+
+    setStatus();
+    return true;
+  }
+
+  // =========================
+  // 15) 翻页（不变）
+  // =========================
+  async function goPrevPageIfPossible() {
+    const prevBtn = document.querySelector('button[aria-label="Previous page"]');
+    if (!prevBtn || prevBtn.disabled) return false;
+    safeClick(prevBtn);
+    await sleep(rands(CONFIG.waitAfterNextPage));
+    return true;
+  }
+
+  async function goNextPage() {
+    const nextBtn = document.querySelector('button[aria-label="Next page"]');
+    if (!nextBtn || nextBtn.disabled) return { hasNext: false, reason: "next_missing_or_disabled" };
+
+    const prevFirst = getAllProfileIdsInDOM()[0] || "";
+
+    await sleep(rands(CONFIG.waitBeforeNextPage));
+    safeClick(nextBtn);
+    await sleep(rands(CONFIG.waitAfterNextPage));
+
+    const ok = await waitFor(() => {
+      if (isNoResultsPage()) return true;
+      const pids = getAllProfileIdsInDOM();
+      if (!pids.length) return false;
+      return (pids[0] || "") !== prevFirst;
+    }, CONFIG.waitPageChangeTimeout);
+
+    if (isNoResultsPage()) {
+      addLog("检测到：翻页后出现 No results found（说明上一页已是最后一页）。准备停止。", "warn");
+      const backOk = await goPrevPageIfPossible();
+      if (backOk) addLog("已尝试回到上一页（最后一页结果页）。", "success");
+      return { hasNext: false, reason: "no_results_page" };
+    }
+
+    if (!ok) addLog("翻页后未检测到首条变化（可能加载慢/或页面结构变化）。继续按当前DOM尝试处理。", "warn");
+    return { hasNext: true, reason: "ok_or_unknown" };
+  }
+
+  // =========================
+  // 16) 普通爬取主循环（不变）
+  // =========================
+  async function runNormalLoop() {
+    state.startedAt = new Date();
+    state.mode = 'normal';
+
+    while (state.isRunning) {
+      await waitIfPaused();
+      if (!state.isRunning) break;
+
+      state.pageIndex++;
+      setStatus();
+      addLog(`===== 开始处理第 ${state.pageIndex} 页（普通模式） =====`, "info");
+
+      if (isNoResultsPage()) {
+        addLog("当前页是 No results found（异常/或误翻页）。已停止。", "error");
+        state.errors++;
+        state.isRunning = false;
+        state.isPaused = false;
+        setStatus();
+        break;
+      }
+
+      let pids = getAllProfileIdsInDOM();
+      if (!pids.length) {
+        addLog("错误：本页未找到任何 profile-selection-xxxx（无法定位列表）。已暂停。", "error");
+        state.errors++;
+        state.isPaused = true;
+        setStatus();
+        continue;
+      }
+
+      const pageSize = getPageSize();
+      const pageSeen = new Set();
+      let stableRounds = 0;
+      let lastSize = 0;
+
+      while (state.isRunning) {
+        await waitIfPaused();
+        if (!state.isRunning) break;
+
+        const now = getAllProfileIdsInDOM();
+        for (const id of now) pageSeen.add(id);
+
+        stableRounds = (pageSeen.size === lastSize) ? (stableRounds + 1) : 0;
+        lastSize = pageSeen.size;
+
+        window.scrollTo(0, document.body.scrollHeight);
+        await sleep(350);
+
+        if (stableRounds >= 3) break;
+        if (pageSeen.size >= pageSize) break;
+      }
+
+      pids = [...pageSeen].slice(0, pageSize);
+      addLog(`本页识别到 pid 数：${pids.length} / ${pageSize}`, "info");
+
+      for (const pid of pids) {
+        await waitIfPaused();
+        if (!state.isRunning) break;
+
+        try {
+          await processOne(pid);
+        } catch (e) {
+          if (e && e.pauseOnly) {
+            addLog(`PAUSE pid=${pid}：${e.message}`, "warn");
+          } else {
+            addLog(`ERROR pid=${pid}：${e.message}（已暂停）`, "error");
+            state.errors++;
+          }
+          state.isPaused = true;
+          setStatus();
+          break;
+        }
+      }
+
+      await waitIfPaused();
+      if (!state.isRunning) break;
+
+      window.scrollTo(0, 0);
+      await sleep(250);
+
+      const next = await goNextPage();
+      if (!next.hasNext) {
+        addLog(`检测到没有下一页。原因：${next.reason}。运行结束。`, "success");
+        state.isRunning = false;
+        state.isPaused = false;
+        setStatus();
+        clickCompaniesTab();
+        addLog("已自动切换到 Companies 标签页。", "info");
+        break;
+      }
+    }
+  }
+
+  // =========================
+  // 17) 全选爬取专用函数（修改：点击 Get Contacts 后等待 1 秒，等待时间从配置读取，并增强 Continue 按钮检测）
+  // =========================
+  // 检查页面是否存在单条 Get Contact Info 按钮
+  function hasSingleGetContactButtons() {
+    return !!document.querySelector('button[data-px-single-lookup="true"]');
+  }
+
+  // 等待特定文本的按钮（基于 span 内的文本）
+  async function waitForButtonBySpanText(text, timeoutMs) {
+    const check = () => {
+      const span = Array.from(document.querySelectorAll('span')).find(s => norm(s.innerText) === text);
+      return span?.closest('button') || null;
+    };
+    const result = await waitFor(check, timeoutMs, 200);
+    return result; // waitFor 现在返回找到的元素
+  }
+
+  // 执行全选批量操作（仅在存在单条按钮时调用）
+  async function performBulkSelect() {
+    addLog("检测到单条 Get Contact Info 按钮，执行全选批量操作...", "info");
+
+    // 点击全选复选框
+    const selectAllCheckbox = document.querySelector('input.results-selection-checkbox');
+    if (!selectAllCheckbox) {
+      throw makePauseError("未找到全选复选框 (input.results-selection-checkbox)");
+    }
+    safeClick(selectAllCheckbox);
+    addLog("已点击全选复选框", "info");
+
+    // 等待0.5秒，让界面响应
+    await sleep(500);
+
+    // 等待并点击 Get Contacts 按钮（基于 span 文本）
+    const getContactsBtn = await waitForButtonBySpanText('Get Contacts', 2000);
+    if (!getContactsBtn || getContactsBtn.disabled) {
+      // 检查复选框是否被选中
+      if (!selectAllCheckbox.checked) {
+        addLog("全选复选框未被勾选，尝试重新点击", "warn");
+        safeClick(selectAllCheckbox);
+        await sleep(500);
+      }
+      // 再次等待
+      const retryBtn = await waitForButtonBySpanText('Get Contacts', 2000);
+      if (!retryBtn || retryBtn.disabled) {
+        throw makePauseError("Get Contacts 按钮未出现或不可点击，请检查页面状态后手动处理。");
+      }
+      safeClick(retryBtn);
+    } else {
+      safeClick(getContactsBtn);
+    }
+    addLog("已点击 Get Contacts 按钮", "info");
+
+    // 等待1秒，确保界面响应
+    await sleep(1000);
+
+    // 修改点：等待 Continue 按钮出现且可点击（disabled 为 false），超时 5 秒
+    const continueBtn = await waitFor(() => {
+      const btn = document.querySelector('#px-confirm-bulk-get-contacts');
+      return btn && !btn.disabled ? btn : null;
+    }, 5000, 200);
+    if (!continueBtn) {
+      throw makePauseError("Continue 按钮未出现或不可点击，请检查页面状态后手动处理。");
+    }
+    safeClick(continueBtn);
+    addLog("已点击 Continue 按钮，开始等待 2-4 分钟...", "info");
+
+    // 可选：再等待0.5秒让请求发送
+    await sleep(500);
+
+    // 从配置读取等待时间，并在日志中明确显示分钟数
+    const waitMs = rands([CONFIG.bulkWaitMin * 60000, CONFIG.bulkWaitMax * 60000]);
+    addLog(`开始等待 ${Math.round(waitMs/60000)} 分钟...`, "info");
+    await sleepWithPause(waitMs);
+    addLog(`等待结束（${Math.round(waitMs/60000)} 分钟），准备抽取本页数据`, "success");
+    return true; // 表示成功执行了批量操作
+  }
+
+  // 全选爬取主循环
+  async function runBulkLoop() {
+    state.startedAt = new Date();
+    state.mode = 'bulk';
+
+    while (state.isRunning) {
+      await waitIfPaused();
+      if (!state.isRunning) break;
+
+      state.pageIndex++;
+      setStatus();
+      addLog(`===== 开始处理第 ${state.pageIndex} 页（全选模式） =====`, "info");
+
+      if (isNoResultsPage()) {
+        addLog("当前页是 No results found（异常/或误翻页）。已停止。", "error");
+        state.errors++;
+        state.isRunning = false;
+        state.isPaused = false;
+        setStatus();
+        break;
+      }
+
+      // 1) 滚动加载所有条目
+      const pageSize = getPageSize();
+      const pageSeen = new Set();
+      let stableRounds = 0;
+      let lastSize = 0;
+
+      while (state.isRunning) {
+        await waitIfPaused();
+        if (!state.isRunning) break;
+
+        const now = getAllProfileIdsInDOM();
+        for (const id of now) pageSeen.add(id);
+
+        stableRounds = (pageSeen.size === lastSize) ? (stableRounds + 1) : 0;
+        lastSize = pageSeen.size;
+
+        window.scrollTo(0, document.body.scrollHeight);
+        await sleep(350);
+
+        if (stableRounds >= 3) break;
+        if (pageSeen.size >= pageSize) break;
+      }
+
+      const allPids = [...pageSeen].slice(0, pageSize);
+      addLog(`本页识别到 pid 数：${allPids.length} / ${pageSize}`, "info");
+
+      // 2) 检查是否存在单条 Get Contact 按钮
+      const hasSingle = hasSingleGetContactButtons();
+      let bulkSuccess = false;
+
+      if (hasSingle) {
+        // 存在单条按钮，执行全选批量操作（可能抛出暂停错误）
+        try {
+          bulkSuccess = await performBulkSelect();
+        } catch (e) {
+          if (e && e.pauseOnly) {
+            addLog(`批量操作暂停：${e.message}`, "warn");
+            state.isPaused = true;
+            setStatus();
+            break;
+          } else {
+            throw e; // 其他错误
+          }
+        }
+      } else {
+        addLog("页面中无单条 Get Contact Info 按钮，直接抽取数据", "info");
+      }
+
+      if (bulkSuccess) {
+        // 批量操作成功，标记所有 pid 已点击 Get Contact
+        for (const pid of allPids) {
+          state.clickedGetContact.add(pid);
+        }
+        addLog(`已将 ${allPids.length} 个条目标记为已获取联系方式`, "info");
+      }
+
+      // 3) 抽取所有条目
+      for (const pid of allPids) {
+        await waitIfPaused();
+        if (!state.isRunning) break;
+
+        try {
+          await processOne(pid);
+        } catch (e) {
+          if (e && e.pauseOnly) {
+            addLog(`PAUSE pid=${pid}：${e.message}`, "warn");
+          } else {
+            addLog(`ERROR pid=${pid}：${e.message}（已暂停）`, "error");
+            state.errors++;
+          }
+          state.isPaused = true;
+          setStatus();
+          break;
+        }
+      }
+
+      await waitIfPaused();
+      if (!state.isRunning) break;
+
+      window.scrollTo(0, 0);
+      await sleep(250);
+
+      // 4) 翻页
+      const next = await goNextPage();
+      if (!next.hasNext) {
+        addLog(`检测到没有下一页。原因：${next.reason}。运行结束。`, "success");
+        state.isRunning = false;
+        state.isPaused = false;
+        setStatus();
+        clickCompaniesTab();
+        addLog("已自动切换到 Companies 标签页。", "info");
+        break;
+      }
+    }
+  }
+
+  // =========================
+  // 18) 开始函数
+  // =========================
+  function startNormal() {
+    if (state.isRunning) {
+      addLog("已在运行中，请先停止。", "warn");
+      return;
+    }
+    state.isRunning = true;
+    state.isPaused = false;
+    setStatus();
+    addLog("开始普通模式运行...", "success");
+
+    runNormalLoop().catch((e) => {
+      addLog(`运行异常退出：${e.message}`, "error");
+      state.errors++;
+      state.isRunning = false;
+      state.isPaused = false;
+      setStatus();
+    });
+  }
+
+  function startBulk() {
+    if (state.isRunning) {
+      addLog("已在运行中，请先停止。", "warn");
+      return;
+    }
+    state.isRunning = true;
+    state.isPaused = false;
+    setStatus();
+    addLog("开始全选模式运行...", "success");
+
+    runBulkLoop().catch((e) => {
+      addLog(`运行异常退出：${e.message}`, "error");
+      state.errors++;
+      state.isRunning = false;
+      state.isPaused = false;
+      setStatus();
+    });
+  }
+
+  // =========================
+  // 19) 销毁
+  // =========================
+  function destroy() {
+    try { state.isRunning = false; state.isPaused = false; } catch (e) {}
+    clearHighlights();
+
+    document.removeEventListener("click", onDocClickCapture, true);
+    uninstallOpenHook();
+
+    panel?.remove();
+    delete window.__PX_RR_SUITE_V332__;
+    console.log("RocketReach Suite v3.3.2 destroyed.");
+  }
+
+  // =========================
+  // 20) 初始化
+  // =========================
+  document.addEventListener("click", onDocClickCapture, true);
+  installOpenHook();
+
+  createPanel();
+
+  window.__PX_RR_SUITE_V332__ = {
+    destroy,
+    start: startNormal,
+    startBulk,
+    stop,
+    togglePause,
+    clearCache,
+    exportRRCSV,
+    insertRocketReachFilters,
+    state
+  };
+
+  flash("面板已启动");
+})();
