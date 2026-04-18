@@ -63,7 +63,7 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
   const rands = (pair) => rand(pair[0], pair[1]);
-  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const norm = () => ( || "").replace(/\s+/g, " ").trim();
 
   function makePauseError(msg) {
     const e = new Error(msg);
